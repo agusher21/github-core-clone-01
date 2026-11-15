@@ -3194,9 +3194,14 @@ def main():
             try:
                 with urllib.request.urlopen(done_url, timeout=30) as response:
                     if response.status == 200:
-                        break
+                        payload = json.loads(response.read().decode("utf-8"))
+                        if isinstance(payload, dict) and payload.get("done") is True:
+                            break
             except Exception:
                 pass
+            # /done answers {"done": false} while the suite runs; poll gently.
+            import time as _time
+            _time.sleep(1)
         server.shutdown()
         server.server_close()
         sys.exit(0)

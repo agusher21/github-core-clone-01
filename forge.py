@@ -28,6 +28,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 from gitcore import (
     CONFORMANCE_IDENTITY, DEFAULT_TIMESTAMP, ZERO_OID, GitError, PktReader,
     apply_delta, build_commit, build_tag, build_tree, collect_reachable,
+    collect_tree_closure,
     decode_all_packets, encode_pkt_lines, global_id, hash_object,
     is_oid, parse_commit, parse_global_id, parse_tag, parse_tree,
     pkt, read_pack, scenario_users, verify_pack_checksum, write_pack,
@@ -2971,9 +2972,16 @@ def _fetch_objects(repo, request):
         view = repo.commit_view(oid)
         if view is not None:
             to_send.update(collect_reachable([view["tree"]], repo.get_object))
-    # have-closure objects are never re-sent
+    # have-closure objects are never re-sent. A shallow have is held only
+    # up to its own tree (its parents are NOT held), so subtract the tree
+    # closure for it; a full have is held with its whole history.
     for oid in have:
-        to_send.difference_update(collect_reachable([oid], repo.get_object))
+        if oid in shallow_set:
+            to_send.difference_update(
+                collect_tree_closure([oid], repo.get_object))
+        else:
+            to_send.difference_update(
+                collect_reachable([oid], repo.get_object))
 
     objects = []
     for oid in sorted(to_send):
@@ -3181,9 +3189,18 @@ ForgeHandler._send_receive_report = _send_receive_report
 # server entrypoint
 # ---------------------------------------------------------------------------
 
+class ForgeServer(ThreadingHTTPServer):
+    # The bench opens 50 concurrent clones; the default listen backlog of
+    # 5 drops most SYNs on the first burst and the retries cost seconds
+    # (clone round 1 was 4.4 s, round 3 was 99 ms once connections were
+    # reused). A deep backlog keeps the burst cheap.
+    request_queue_size = 128
+    daemon_threads = True
+    allow_reuse_address = True
+
+
 def create_server():
-    server = ThreadingHTTPServer(("127.0.0.1", 0), ForgeHandler)
-    server.daemon_threads = True
+    server = ForgeServer(("127.0.0.1", 0), ForgeHandler)
     return server
 
 

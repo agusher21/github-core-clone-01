@@ -122,6 +122,36 @@ def parse_tag(data: bytes):
     return view
 
 
+def collect_tree_closure(roots, lookup, allow_missing=False):
+    """Every oid reachable from roots through trees/tags only — never
+    through commit parents. A shallow client holds a boundary commit and
+    its tree, but NOT the boundary's parents, so this is the correct
+    subtraction set for a shallow have."""
+
+    seen = set()
+    queue = [oid for oid in roots if is_oid(oid)]
+    while queue:
+        oid = queue.pop()
+        if oid in seen:
+            continue
+        found = lookup(oid)
+        if found is None:
+            if allow_missing:
+                continue
+            raise GitError("object %s is missing from the store" % oid)
+        otype, data = found
+        seen.add(oid)
+        if otype == "commit":
+            queue.append(parse_commit(data)["tree"])
+        elif otype == "tag":
+            queue.append(parse_tag(data)["object"])
+        elif otype == "tree":
+            for mode, _name, child in parse_tree(data):
+                if mode != "160000":
+                    queue.append(child)
+    return seen
+
+
 def collect_reachable(roots, lookup, allow_missing=False):
     """Every oid reachable from roots through commits/trees/tags.
 

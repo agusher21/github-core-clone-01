@@ -707,6 +707,17 @@ class ForgeHandler(BaseHTTPRequestHandler):
     def do_DELETE(self):
         self._dispatch()
 
+    def setup(self):
+        super().setup()
+        # Nagle + delayed-ACK costs ~20 ms per small response against
+        # Node's fetch; disable it and write each response in one segment.
+        try:
+            import socket as _socket
+            self.connection.setsockopt(
+                _socket.IPPROTO_TCP, _socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
+
     # -- plumbing ---------------------------------------------------------
     def _send(self, status, body: bytes, content_type, extra=None):
         headers = {"Content-Type": content_type,
@@ -714,12 +725,17 @@ class ForgeHandler(BaseHTTPRequestHandler):
                    "X-GitHub-Request-Id": STORE.next_request_id()}
         if extra:
             headers.update(extra)
-        self.send_response(status)
+        # One write for the whole response: BaseHTTPRequestHandler's
+        # send_response/send_header/end_headers split the headers into
+        # many small sends, and Nagle + delayed ACK stalls each of them
+        # against Node's fetch (~20 ms per request). A single write is
+        # ~1 ms.
+        lines = ["HTTP/1.1 %d %s" % (status, self.responses.get(
+            status, ("???",))[0])]
         for key, value in headers.items():
-            self.send_header(key, value)
-        self.end_headers()
-        if body:
-            self.wfile.write(body)
+            lines.append("%s: %s" % (key, value))
+        raw = ("\r\n".join(lines) + "\r\n\r\n").encode("ascii") + body
+        self.wfile.write(raw)
 
     def _send_json(self, status, obj, extra=None):
         if obj is None:
@@ -2919,6 +2935,9 @@ def _fetch_objects(repo, request):
         queue.extend((p, gen + 1) for p in view["parents"])
 
     # --- walk what the client already has ---------------------------------
+    # A have that is also a shallow boundary is held only up to itself:
+    # its parents are NOT held, so the walk stops there (this is what lets
+    # a deepen fetch deliver the parent past the boundary).
     have = set()
     queue = list(request["haves"])
     while queue:
@@ -2929,7 +2948,8 @@ def _fetch_objects(repo, request):
         if view is None:
             continue
         have.add(oid)
-        queue.extend(view["parents"])
+        if oid not in shallow_set:
+            queue.extend(view["parents"])
 
     wanted = set(generations)
     shallow_out = []
@@ -2973,19 +2993,25 @@ def _sideband_pack(pack):
 
 
 def _ls_refs_response(repo, prefixes, peel, symrefs, unborn):
-    """v2 ls-refs answer: one line per ref, HEAD first, then a flush."""
+    """v2 ls-refs answer: one line per ref, HEAD first, then a flush.
+    A ref-prefix filters every line, HEAD included: HEAD is listed only
+    when no prefix is given or one of them matches HEAD itself."""
+    def matches(name):
+        return not prefixes or any(name.startswith(p) for p in prefixes)
+
     lines = []
     default_tip = repo.ref_tip("refs/heads/" + repo.default_branch)
-    if default_tip:
-        line = "%s HEAD" % default_tip
-        if symrefs:
-            line += " symref-target:refs/heads/%s" % repo.default_branch
-        lines.append(line)
-    elif unborn:
-        line = "unborn HEAD"
-        if symrefs:
-            line += " symref-target:refs/heads/%s" % repo.default_branch
-        lines.append(line)
+    if matches("HEAD"):
+        if default_tip:
+            line = "%s HEAD" % default_tip
+            if symrefs:
+                line += " symref-target:refs/heads/%s" % repo.default_branch
+            lines.append(line)
+        elif unborn:
+            line = "unborn HEAD"
+            if symrefs:
+                line += " symref-target:refs/heads/%s" % repo.default_branch
+            lines.append(line)
     for refname, oid in sorted(repo.refs.items()):
         if prefixes and not any(refname.startswith(p) for p in prefixes):
             continue

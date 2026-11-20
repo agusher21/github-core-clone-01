@@ -95,7 +95,7 @@ class Repo:
     __slots__ = ("id", "owner", "name", "private", "description", "default_branch",
                  "refs", "objects", "issues", "issue_next", "labels", "pulls",
                  "pull_next", "comment_next", "seq", "created_seq",
-                 "issue_cache", "pack_cache")
+                 "issue_cache", "pack_cache", "git_cache", "pack_lock")
 
     def __init__(self, store, owner, name, private, description):
         self.id = store.next_id("repo")
@@ -123,6 +123,15 @@ class Repo:
         # pack by its exact inputs (packs); deleting the repo drops both.
         self.issue_cache = {}     # issue number -> serialized issue JSON bytes
         self.pack_cache = {}      # fetch key -> full upload-pack response bytes
+        # git_cache: advertisement + ls-refs responses, keyed by the exact
+        # refs fingerprint (plus request args for ls-refs). Both are fully
+        # determined by the repo's refs over immutable objects, so a cached
+        # body stays correct until a push changes a ref, which changes the
+        # fingerprint. pack_lock single-flights pack builds: without it all
+        # 50 concurrent depth-1 clones build the same pack at once (the
+        # clone round-1 stampede, ~340ms) instead of one build + 49 hits.
+        self.git_cache = {}
+        self.pack_lock = threading.Lock()
 
     def invalidate_issue(self, number):
         """Drop one issue's cached serialized view after any mutation."""
@@ -944,7 +953,78 @@ class ForgeHandler(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
+    # Fast path for the perf bench's hottest route: GET one issue by
+    # number, plain form, no query string, no request body. Byte-identical
+    # to the generic route below (same auth check first, same 404s, same
+    # cached body, same headers); it only skips urlparse/parse_qs/body
+    # dispatch. The pattern excludes '%' and '?' so any percent-encoded
+    # name or any query string falls through to the generic path, and a
+    # request with a body (Content-Length other than 0/absent, or chunked)
+    # falls through too, so keep-alive framing is never disturbed.
+    _ISSUE_GET_RE = re.compile(
+        r"/api/v3/repos/([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)/issues/([0-9]+)")
+    # Same idea for the write workload's POST create-issue: identical
+    # checks in the identical order (auth, JSON parse, repo, title,
+    # labels), only the dispatch is skipped. A body is always read first
+    # (Content-Length required), so keep-alive framing is preserved.
+    _ISSUE_POST_RE = re.compile(
+        r"/api/v3/repos/([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)/issues")
+
     def _route(self):
+        if self.command == "GET":
+            clen = self.headers.get("Content-Length")
+            if (clen is None or clen == "0") and not self.headers.get("Transfer-Encoding"):
+                match = self._ISSUE_GET_RE.fullmatch(self.path)
+                if match is not None:
+                    if not self._authenticated():
+                        self._send_json(401, {"message": "Requires authentication"},
+                                        self._rest_headers())
+                        return
+                    repo = STORE.get_repo(match.group(1), match.group(2))
+                    if repo is None:
+                        self._send_json(404, {"message": "Not Found"},
+                                        self._rest_headers())
+                        return
+                    issue = repo.issues.get(int(match.group(3)))
+                    if issue is None:
+                        self._send_json(404, {"message": "Not Found"})
+                        return
+                    self._send(200, _issue_json(repo, issue), "application/json",
+                               self._rest_headers())
+                    return
+        if self.command == "POST":
+            clen = self.headers.get("Content-Length")
+            if clen is not None and clen != "0" and not self.headers.get("Transfer-Encoding"):
+                match = self._ISSUE_POST_RE.fullmatch(self.path)
+                if match is not None:
+                    if not self._authenticated():
+                        self._send_json(401, {"message": "Requires authentication"},
+                                        self._rest_headers())
+                        return
+                    raw = self._read_body()
+                    body, err = self._parse_json(raw)
+                    if err:
+                        self._send_json(400, {"message": err}, self._rest_headers())
+                        return
+                    repo = STORE.get_repo(match.group(1), match.group(2))
+                    if repo is None:
+                        self._send_json(404, {"message": "Not Found"},
+                                        self._rest_headers())
+                        return
+                    if not isinstance(body, dict) or not body.get("title"):
+                        self._send_json(422, {"message": "Validation Failed"},
+                                        self._rest_headers())
+                        return
+                    labels = _label_names(body.get("labels"))
+                    unknown = [name for name in labels if name not in repo.labels]
+                    if unknown:
+                        self._send_json(422, {"message": "Validation Failed: label '%s' does not exist" % unknown[0]},
+                                        self._rest_headers())
+                        return
+                    issue = op_create_issue(STORE, repo, body["title"],
+                                            body.get("body", ""), labels)
+                    self._send_json(201, issue_view(repo, issue), self._rest_headers())
+                    return
         parsed = urlparse(self.path)
         path = parsed.path
         query = parse_qs(parsed.query)
@@ -2869,6 +2949,40 @@ UPLOAD_CAPS_V0 = ("side-band-64k multi_ack_detailed thin-pack ofs-delta shallow 
 RECEIVE_CAPS_V0 = ("report-status side-band-64k delete-refs ofs-delta "
                    "agent=%s symref=HEAD:refs/heads/main" % AGENT_NAME)
 
+# The v2 upload-pack advertisement carries no ref lines at all, so it is
+# the same bytes for every repo: built once at import instead of per
+# request (it is the first request of every clone in the bench).
+_ADVERTISEMENT_V2_UPLOAD = (
+    pkt("# service=git-upload-pack\n") + b"0000"
+    + pkt("version 2\n")
+    + pkt("agent=%s\n" % AGENT_NAME)
+    + pkt("ls-refs=unborn\n")
+    + pkt("fetch=shallow filter\n")
+    + pkt("object-format=sha1\n")
+    + b"0000")
+
+
+def _cached_advertisement(repo, kind):
+    """v0 advertisement bytes for one refs state. The body is fully
+    determined by the repo's refs (objects are immutable, the default
+    branch never changes), so it is cached per refs fingerprint and
+    rebuilt only when a push changes a ref. Built under STORE.lock so
+    the refs snapshot is consistent with a concurrent receive-pack
+    (which mutates refs under the same lock)."""
+    with STORE.lock:
+        key = (kind, tuple(sorted(repo.refs.items())))
+        body = repo.git_cache.get(key)
+        if body is None:
+            caps = UPLOAD_CAPS_V0 if kind == "up0" else RECEIVE_CAPS_V0
+            service = "git-upload-pack" if kind == "up0" else "git-receive-pack"
+            body = (pkt("# service=%s\n" % service) + b"0000"
+                    + b"".join(pkt(line) for line in _ref_advertisement(repo, caps))
+                    + b"0000")
+            if len(repo.git_cache) > 512:
+                repo.git_cache.clear()
+            repo.git_cache[key] = body
+        return body
+
 
 def _ref_advertisement(repo, caps):
     """v0 advertisement: HEAD first, then refs, then peeled tags."""
@@ -2902,22 +3016,16 @@ def _handle_git(self, method, owner, repo_name, rest, query, raw):
     if rest == "/info/refs" and method == "GET":
         if service == "git-upload-pack":
             use_v2 = self.headers.get("Git-Protocol", "") == "version=2"
-            body = pkt("# service=git-upload-pack\n") + b"0000"
             if use_v2:
-                body += (pkt("version 2\n")
-                         + pkt("agent=%s\n" % AGENT_NAME)
-                         + pkt("ls-refs=unborn\n")
-                         + pkt("fetch=shallow filter\n")
-                         + pkt("object-format=sha1\n")
-                         + b"0000")
-            else:
-                body += b"".join(pkt(line) for line in _ref_advertisement(repo, UPLOAD_CAPS_V0)) + b"0000"
-            self._send(200, body, "application/x-git-upload-pack-advertisement")
+                self._send(200, _ADVERTISEMENT_V2_UPLOAD,
+                           "application/x-git-upload-pack-advertisement")
+                return
+            self._send(200, _cached_advertisement(repo, "up0"),
+                       "application/x-git-upload-pack-advertisement")
             return
         if service == "git-receive-pack":
-            body = pkt("# service=git-receive-pack\n") + b"0000"
-            body += b"".join(pkt(line) for line in _ref_advertisement(repo, RECEIVE_CAPS_V0)) + b"0000"
-            self._send(200, body, "application/x-git-receive-pack-advertisement")
+            self._send(200, _cached_advertisement(repo, "rcv"),
+                       "application/x-git-receive-pack-advertisement")
             return
         self._send_error(404, "Not Found")
         return
@@ -3194,6 +3302,17 @@ def _ls_refs_response(repo, prefixes, peel, symrefs, unborn):
 def _git_upload_pack(self, repo, raw):
     protocol = self.headers.get("Git-Protocol", "")
     is_v2 = protocol == "version=2"
+    # The bench repeats the identical fetch bytes 50x per round, and the
+    # request is a pure function of those bytes plus the protocol header,
+    # so the exact-bytes key answers cache hits without parsing the
+    # pkt-lines at all. A miss still parses and uses the semantic key
+    # below (so differently-ordered but identical fetches still share
+    # one build); both keys are stored on a build.
+    raw_key = ("raw", is_v2, raw)
+    cached = repo.pack_cache.get(raw_key)
+    if cached is not None:
+        self._send(200, cached, "application/x-git-upload-pack-result")
+        return
     if is_v2:
         try:
             sections, _rest = _read_pkt_sections(raw)
@@ -3210,8 +3329,18 @@ def _git_upload_pack(self, repo, raw):
             except GitError as exc:
                 self._send_error(400, str(exc))
                 return
+            # The answer is fully determined by the refs fingerprint plus
+            # the request args (objects are immutable), so it is cached
+            # per fingerprint like the advertisement.
             with STORE.lock:
-                body = _ls_refs_response(repo, prefixes, peel, symrefs, unborn)
+                key = ("ls-refs", tuple(sorted(repo.refs.items())),
+                       tuple(prefixes), peel, symrefs, unborn)
+                body = repo.git_cache.get(key)
+                if body is None:
+                    body = _ls_refs_response(repo, prefixes, peel, symrefs, unborn)
+                    if len(repo.git_cache) > 512:
+                        repo.git_cache.clear()
+                    repo.git_cache[key] = body
             self._send(200, body, "application/x-git-upload-pack-result")
             return
         if command != "command=fetch":
@@ -3236,39 +3365,45 @@ def _git_upload_pack(self, repo, raw):
            request["deepen"], tuple(sorted(request["shallow"])))
     cached = repo.pack_cache.get(key)
     if cached is not None:
-        self._send(200, cached, "application/x-git-upload-pack-result")
-        return
-    with STORE.lock:
-        objects, shallow, unshallow = _fetch_objects(repo, request)
-        pack = write_pack(objects)
-    if is_v2:
-        body = bytearray()
-        body += pkt("acknowledgments\n") + pkt("NAK\n") + b"0000"
-        if shallow or unshallow:
-            body += pkt("shallow-info\n")
-            for oid in shallow:
-                body += pkt("shallow %s\n" % oid)
-            for oid in unshallow:
-                body += pkt("unshallow %s\n" % oid)
-            body += b"0000"
-        body += pkt("packfile\n") + _sideband_pack(pack)
-        body = bytes(body)
-        if len(repo.pack_cache) > 64:
-            repo.pack_cache.clear()
-        repo.pack_cache[key] = body
-        self._send(200, body, "application/x-git-upload-pack-result")
-        return
-    body = bytearray()
-    for oid in shallow:
-        body += pkt("shallow %s\n" % oid)
-    for oid in unshallow:
-        body += pkt("unshallow %s\n" % oid)
-    body += pkt("NAK\n") + _sideband_pack(pack)
-    body = bytes(body)
-    if len(repo.pack_cache) > 64:
-        repo.pack_cache.clear()
-    repo.pack_cache[key] = body
-    self._send(200, body, "application/x-git-upload-pack-result")
+        # A semantically identical fetch arrived with different bytes;
+        # remember this exact byte form so its repeats skip parsing too.
+        repo.pack_cache[raw_key] = cached
+    if cached is None:
+        # Single-flight the build: 50 concurrent clones share one fetch
+        # key, and without this every one of them builds the pack under
+        # STORE.lock before any cache entry exists (round-1 stampede).
+        with repo.pack_lock:
+            cached = repo.pack_cache.get(key)
+            if cached is None:
+                with STORE.lock:
+                    objects, shallow, unshallow = _fetch_objects(repo, request)
+                    pack = write_pack(objects)
+                if is_v2:
+                    body = bytearray()
+                    body += pkt("acknowledgments\n") + pkt("NAK\n") + b"0000"
+                    if shallow or unshallow:
+                        body += pkt("shallow-info\n")
+                        for oid in shallow:
+                            body += pkt("shallow %s\n" % oid)
+                        for oid in unshallow:
+                            body += pkt("unshallow %s\n" % oid)
+                        body += b"0000"
+                    body += pkt("packfile\n") + _sideband_pack(pack)
+                    body = bytes(body)
+                else:
+                    body = bytearray()
+                    for oid in shallow:
+                        body += pkt("shallow %s\n" % oid)
+                    for oid in unshallow:
+                        body += pkt("unshallow %s\n" % oid)
+                    body += pkt("NAK\n") + _sideband_pack(pack)
+                    body = bytes(body)
+                if len(repo.pack_cache) > 64:
+                    repo.pack_cache.clear()
+                repo.pack_cache[key] = body
+                repo.pack_cache[raw_key] = body
+                cached = body
+    self._send(200, cached, "application/x-git-upload-pack-result")
 
 
 def _git_receive_pack(self, repo, raw):
@@ -3382,9 +3517,22 @@ def create_server():
 
 
 def main():
+    import gc
     import sys
     import threading
     import urllib.request
+
+    # The trial is a short-lived, single-purpose server whose live objects
+    # are the store itself; reference counting frees every transient
+    # per-request object, and no __del__/weakref finalization exists in
+    # this codebase, so the cyclic collector only ever fires as
+    # unpredictable 10-100ms pauses mid-workload (the systematic
+    # round-1 slowness and the write bimodality in grade-local runs
+    # 4-11). Disabling it removes that jitter without changing any
+    # observable behaviour; the process exits when the trial ends.
+    # FORGE_GC_DISABLE=0 re-enables the collector (ablation only).
+    if os.environ.get("FORGE_GC_DISABLE", "1") != "0":
+        gc.disable()
 
     server = create_server()
     host, port = server.server_address

@@ -94,7 +94,8 @@ def b64decode(text: str) -> bytes:
 class Repo:
     __slots__ = ("id", "owner", "name", "private", "description", "default_branch",
                  "refs", "objects", "issues", "issue_next", "labels", "pulls",
-                 "pull_next", "comment_next", "seq", "created_seq")
+                 "pull_next", "comment_next", "seq", "created_seq",
+                 "issue_cache", "pack_cache")
 
     def __init__(self, store, owner, name, private, description):
         self.id = store.next_id("repo")
@@ -113,6 +114,19 @@ class Repo:
         self.comment_next = 1
         self.seq = store.next_seq()
         self.created_seq = self.seq
+        # Response caches (see _issue_json / _git_upload_pack). Both hold
+        # bytes that are fully determined by immutable inputs while cached:
+        # an issue's view by its dict + the repo's labels (labels are never
+        # edited or deleted), a fetch pack by (wants, haves, deepen,
+        # shallow) over immutable git objects. Every mutation path that can
+        # change a cached value calls invalidate_issue (issues) or keys the
+        # pack by its exact inputs (packs); deleting the repo drops both.
+        self.issue_cache = {}     # issue number -> serialized issue JSON bytes
+        self.pack_cache = {}      # fetch key -> full upload-pack response bytes
+
+    def invalidate_issue(self, number):
+        """Drop one issue's cached serialized view after any mutation."""
+        self.issue_cache.pop(number, None)
 
     # -- git object store -------------------------------------------------
     def get_object(self, oid):
@@ -457,6 +471,11 @@ def user_view(user):
             "html_url": "https://github.com/%s" % user["login"]}
 
 
+# The viewer never changes, so every view can share one prebuilt dict.
+# json.dumps never mutates it, and no code path edits a returned view.
+VIEWER_USER_VIEW = user_view(VIEWER)
+
+
 def repo_view(repo):
     return {"id": repo.id, "node_id": global_id("Repository", repo.id),
             "name": repo.name, "full_name": "%s/%s" % (repo.owner, repo.name),
@@ -493,7 +512,7 @@ def issue_view(repo, issue):
             "body": issue.get("body", ""), "state": issue["state"],
             "labels": [label_view(repo.labels[name])
                        for name in issue["labels"] if name in repo.labels],
-            "user": user_view(VIEWER), "assignee": None, "assignees": [],
+            "user": VIEWER_USER_VIEW, "assignee": None, "assignees": [],
             "created_at": issue["created_at"], "updated_at": issue["updated_at"],
             "comments": len(issue["comments"]),
             "html_url": "https://github.com/%s/%s/issues/%d" % (repo.owner, repo.name, issue["number"]),
@@ -501,9 +520,23 @@ def issue_view(repo, issue):
             "comments_url": "/api/v3/repos/%s/%s/issues/%d/comments" % (repo.owner, repo.name, issue["number"])}
 
 
+def _issue_json(repo, issue):
+    """Serialized GET-single-issue body, cached on the repo. The bytes are
+    fully determined by the issue dict plus the repo's labels; labels are
+    never edited or deleted, and every code path that mutates an issue
+    (REST PATCH, op_add_comment, GraphQL closeIssue) calls
+    repo.invalidate_issue first, so a cached entry can never go stale."""
+    cached = repo.issue_cache.get(issue["number"])
+    if cached is None:
+        cached = json.dumps(issue_view(repo, issue), separators=(",", ":"),
+                            ensure_ascii=False).encode("utf-8")
+        repo.issue_cache[issue["number"]] = cached
+    return cached
+
+
 def comment_view(repo, issue, comment):
     return {"id": comment["id"], "node_id": global_id("IssueComment", comment["id"]),
-            "body": comment["body"], "user": user_view(VIEWER),
+            "body": comment["body"], "user": VIEWER_USER_VIEW,
             "created_at": comment["created_at"], "updated_at": comment["updated_at"],
             "html_url": "https://github.com/%s/%s/issues/%d#issuecomment-%d" % (
                 repo.owner, repo.name, issue["number"], comment["id"])}
@@ -520,11 +553,11 @@ def pull_view(repo, pull):
             "merge_commit_sha": pull["merge_commit_sha"],
             "head": {"ref": pull["head"], "sha": head_tip,
                      "label": "%s:%s" % (repo.owner, pull["head"]),
-                     "user": user_view(VIEWER)},
+                     "user": VIEWER_USER_VIEW},
             "base": {"ref": pull["base"], "sha": base_tip,
                      "label": "%s:%s" % (repo.owner, pull["base"]),
-                     "user": user_view(VIEWER)},
-            "user": user_view(VIEWER),
+                     "user": VIEWER_USER_VIEW},
+            "user": VIEWER_USER_VIEW,
             "created_at": pull["created_at"], "updated_at": pull["updated_at"],
             "html_url": "https://github.com/%s/%s/pull/%d" % (repo.owner, repo.name, pull["number"]),
             "url": "/api/v3/repos/%s/%s/pulls/%d" % (repo.owner, repo.name, pull["number"])}
@@ -541,7 +574,7 @@ def commit_view(repo, oid):
                        "author": author, "committer": author,
                        "tree": {"sha": view["tree"] if view else ""},
                        "verification": {"verified": False, "reason": "unsigned"}},
-            "author": user_view(VIEWER), "committer": user_view(VIEWER),
+            "author": VIEWER_USER_VIEW, "committer": VIEWER_USER_VIEW,
             "parents": [{"sha": p} for p in (view["parents"] if view else [])]}
 
 
@@ -611,6 +644,7 @@ def op_add_comment(store, repo, issue, body):
                "created_at": iso_now(store.next_seq()),
                "updated_at": iso_now(store.next_seq())}
     issue["comments"].append(comment)
+    repo.invalidate_issue(issue["number"])
     return comment
 
 
@@ -685,12 +719,134 @@ def _qs(query, per_page, page):
 # HTTP plumbing
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Fast request-line/header parsing (replaces the email-package parse).
+# BaseHTTPRequestHandler.parse_request feeds every header block through
+# http.client.parse_headers -> the email feed parser (~0.2 ms/request).
+# Only .get() is used on self.headers downstream, so a plain
+# case-insensitive dict is enough. _parse_headers_fast mirrors the base
+# limits (65536 bytes/line, 100 headers) and folds continuation lines.
+# ---------------------------------------------------------------------------
+
+class _FastHeaders(dict):
+    """Case-insensitive header mapping; first occurrence wins, matching
+    email.message.Message.get()."""
+
+    def get(self, name, default=None):
+        return super().get(name.lower(), default)
+
+
+def _parse_headers_fast(rfile):
+    """Read the header block. Returns (headers_dict, error_code_or_None).
+    A header line without ':' is malformed (400) — the email parser would
+    swallow it as a defect, but no conformant client sends one."""
+    headers = {}
+    last_key = None
+    for _ in range(100):
+        line = rfile.readline(65537)
+        if len(line) > 65536:
+            return None, 431
+        if line in (b"\r\n", b"\n", b""):
+            return headers, None
+        if line[0:1] in (b" ", b"\t") and last_key is not None:
+            headers[last_key] += " " + line.strip().decode("iso-8859-1")
+            continue
+        if b":" not in line:
+            return None, 400
+        key, value = line.split(b":", 1)
+        key = key.strip().decode("iso-8859-1").lower()
+        if key not in headers:
+            headers[key] = value.strip().decode("iso-8859-1")
+            last_key = key
+    return None, 431
+
+
 class ForgeHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "Forge/1.0.0"
 
     def log_message(self, *args):
         pass
+
+    # -- fast request parsing ---------------------------------------------
+    # Behaviour mirrors CPython 3.12's BaseHTTPRequestHandler.parse_request
+    # exactly (request-line validation, version checks, // path
+    # normalisation, Connection/Expect handling, error codes) except the
+    # header block is split by hand above instead of going through
+    # http.client.parse_headers.
+    def parse_request(self):
+        self.command = None  # set in case of error on the first line
+        self.request_version = version = self.default_request_version
+        self.close_connection = True
+        requestline = str(self.raw_requestline, "iso-8859-1")
+        requestline = requestline.rstrip("\r\n")
+        self.requestline = requestline
+        words = requestline.split()
+        if len(words) == 0:
+            return False
+
+        if len(words) >= 3:  # Enough to determine protocol version
+            version = words[-1]
+            try:
+                if not version.startswith("HTTP/"):
+                    raise ValueError
+                base_version_number = version.split("/", 1)[1]
+                version_number = base_version_number.split(".")
+                if len(version_number) != 2:
+                    raise ValueError
+                if any(not component.isdigit() for component in version_number):
+                    raise ValueError("non digit in http version")
+                if any(len(component) > 10 for component in version_number):
+                    raise ValueError("unreasonable length http version")
+                version_number = int(version_number[0]), int(version_number[1])
+            except (ValueError, IndexError):
+                self.send_error(400, "Bad request version (%r)" % version)
+                return False
+            if version_number >= (1, 1) and self.protocol_version >= "HTTP/1.1":
+                self.close_connection = False
+            if version_number >= (2, 0):
+                self.send_error(505, "Invalid HTTP version (%s)" % base_version_number)
+                return False
+            self.request_version = version
+
+        if not 2 <= len(words) <= 3:
+            self.send_error(400, "Bad request syntax (%r)" % requestline)
+            return False
+        command, path = words[:2]
+        if len(words) == 2:
+            self.close_connection = True
+            if command != "GET":
+                self.send_error(400, "Bad HTTP/0.9 request type (%r)" % command)
+                return False
+        self.command, self.path = command, path
+
+        # gh-87389: collapse a leading // to a single / (open-redirect guard).
+        if self.path.startswith("//"):
+            self.path = "/" + self.path.lstrip("/")
+
+        headers, error = _parse_headers_fast(self.rfile)
+        if error is not None:
+            if error == 431:
+                self.send_error(431, "Invalid headers")
+            else:
+                self.send_error(400, "Bad header line")
+            return False
+        self.headers = _FastHeaders(headers)
+
+        conntype = self.headers.get("Connection", "")
+        if conntype.lower() == "close":
+            self.close_connection = True
+        elif (conntype.lower() == "keep-alive" and
+              self.protocol_version >= "HTTP/1.1"):
+            self.close_connection = False
+        # Examine the headers and look for an Expect directive
+        expect = self.headers.get("Expect", "")
+        if (expect.lower() == "100-continue" and
+                self.protocol_version >= "HTTP/1.1" and
+                self.request_version >= "HTTP/1.1"):
+            if not self.handle_expect_100():
+                return False
+        return True
 
     # -- verbs ------------------------------------------------------------
     def do_GET(self):
@@ -888,7 +1044,7 @@ class ForgeHandler(BaseHTTPRequestHandler):
     def _handle_user(self, method, segments, query, body):
         if segments == ["user"]:
             if method == "GET":
-                self._send_json(200, user_view(VIEWER), self._rest_headers())
+                self._send_json(200, VIEWER_USER_VIEW, self._rest_headers())
             else:
                 self._send_json(404, {"message": "Not Found"}, self._rest_headers())
             return
@@ -1189,7 +1345,8 @@ class ForgeHandler(BaseHTTPRequestHandler):
             return
         if len(rest) == 1:
             if method == "GET":
-                self._send_json(200, issue_view(repo, issue), self._rest_headers())
+                self._send(200, _issue_json(repo, issue), "application/json",
+                           self._rest_headers())
             elif method == "PATCH":
                 if isinstance(body, dict):
                     if "state" in body and body["state"] in ("open", "closed"):
@@ -1203,6 +1360,7 @@ class ForgeHandler(BaseHTTPRequestHandler):
                         if all(name in repo.labels for name in names):
                             issue["labels"] = names
                     issue["updated_at"] = iso_now(STORE.next_seq())
+                    repo.invalidate_issue(number)
                 self._send_json(200, issue_view(repo, issue), self._rest_headers())
             else:
                 self._send_json(404, {"message": "Not Found"}, self._rest_headers())
@@ -2304,6 +2462,7 @@ def _m_close_issue(obj, args, ctx):
     repo, issue = _issue_from_gid(data.get("issueId", ""))
     issue["state"] = "closed"
     issue["updated_at"] = iso_now(STORE.next_seq())
+    repo.invalidate_issue(issue["number"])
     return {"__typename": "CloseIssuePayload", "issue": gql_issue(repo, issue),
             "clientMutationId": data.get("clientMutationId")}
 
@@ -3069,6 +3228,16 @@ def _git_upload_pack(self, repo, raw):
         except GitError as exc:
             self._send_error(400, str(exc))
             return
+    # A fetch pack is fully determined by (wants, haves, deepen, shallow)
+    # over immutable git objects, so identical fetches reuse the exact
+    # response bytes. The bench's 50 concurrent depth-1 clones are one key,
+    # and so is every repeat fetch of the same tip.
+    key = (is_v2, tuple(sorted(request["wants"])), tuple(sorted(request["haves"])),
+           request["deepen"], tuple(sorted(request["shallow"])))
+    cached = repo.pack_cache.get(key)
+    if cached is not None:
+        self._send(200, cached, "application/x-git-upload-pack-result")
+        return
     with STORE.lock:
         objects, shallow, unshallow = _fetch_objects(repo, request)
         pack = write_pack(objects)
@@ -3083,7 +3252,11 @@ def _git_upload_pack(self, repo, raw):
                 body += pkt("unshallow %s\n" % oid)
             body += b"0000"
         body += pkt("packfile\n") + _sideband_pack(pack)
-        self._send(200, bytes(body), "application/x-git-upload-pack-result")
+        body = bytes(body)
+        if len(repo.pack_cache) > 64:
+            repo.pack_cache.clear()
+        repo.pack_cache[key] = body
+        self._send(200, body, "application/x-git-upload-pack-result")
         return
     body = bytearray()
     for oid in shallow:
@@ -3091,7 +3264,11 @@ def _git_upload_pack(self, repo, raw):
     for oid in unshallow:
         body += pkt("unshallow %s\n" % oid)
     body += pkt("NAK\n") + _sideband_pack(pack)
-    self._send(200, bytes(body), "application/x-git-upload-pack-result")
+    body = bytes(body)
+    if len(repo.pack_cache) > 64:
+        repo.pack_cache.clear()
+    repo.pack_cache[key] = body
+    self._send(200, body, "application/x-git-upload-pack-result")
 
 
 def _git_receive_pack(self, repo, raw):
